@@ -106,6 +106,10 @@ def refresh(force=False):
 
 
 def search(query, scope=None, limit=10):
+    if not state["indexed"]:
+        return {"query": query, "indexing": True,
+                "note": "background index warming; use the live lane",
+                "live": live_grep(query, scope, limit)}
     conn = db()
     q = " ".join(w.replace('"', '""') for w in query.split() if w) or '""'
     sql = ("SELECT path, title, bm25(docs_fts) AS rank FROM docs_fts WHERE docs_fts MATCH ? "
@@ -197,18 +201,21 @@ def send(obj):
 
 
 async def main():
-    # warm the index at boot (fast incremental)
-    try:
-        send_log = refresh()
-        send({"jsonrpc": "2.0", "method": "notifications/message",
-              "params": {"level": "info", "data": "docs-mcp indexed %d docs" % send_log["docs"]}})
-    except Exception as e:
-        log_line = "index warm failed: %s" % e
-        sys.stderr.write("docs-mcp: %s\n" % log_line)
-    loop = asyncio.get_event_loop()
+    # index in a BACKGROUND thread: serve MCP immediately; search_docs before
+    # the index warms reports "indexing" + the live ffs lane still answers.
+    import threading
+    threading.Thread(target=_bg_index, daemon=True).start()
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    def _reader():
+        for line in sys.stdin:
+            loop.call_soon_threadsafe(queue.put_nowait, line)
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+    import threading
+    threading.Thread(target=_reader, daemon=True).start()
     while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
+        line = await queue.get()
+        if line is None:
             break
         line = line.strip()
         if not line:
@@ -241,6 +248,14 @@ async def main():
         else:
             if rid is not None:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method %s not supported" % method}})
+
+
+def _bg_index():
+    try:
+        r = refresh()
+        sys.stderr.write("docs-mcp: background index done %s\n" % json.dumps(r))
+    except Exception as e:
+        sys.stderr.write("docs-mcp: index error %s\n" % e)
 
 
 if __name__ == "__main__":
