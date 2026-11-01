@@ -15,8 +15,10 @@ const PENS = process.env.DOCS_MCP_ROOT ?? "/home/toxic/pens";
 const DB_PATH = `${process.env.HOME}/.cache/morphe/docs-index.sqlite3`;
 const SKIP = new Set(["node_modules", ".git", "target", "dist", "build", ".venv",
   "venv", "__pycache__", ".cache", "bazel-out", "bazel-bin", "bazel-testlogs",
-  "bazel-tau", ".next", ".turbo"]);
+  "bazel-tau", ".next", ".turbo", "archive", "runs", "vendor", ".pytest_cache"]);
 const EXTS = new Set([".md", ".txt", ".rst"]);
+// Data dumps >512KB are provenance dumps, not docs — index their head only.
+const BODY_CAP = 524_288;
 
 const state = { indexed: 0, bytes: 0, lastRefresh: 0, scanning: false };
 
@@ -29,8 +31,16 @@ function db(): Database {
   conn.exec("PRAGMA busy_timeout = 5000");
   conn.exec(`CREATE TABLE IF NOT EXISTS docs (
     path TEXT PRIMARY KEY, mtime REAL, size INTEGER, title TEXT, body TEXT)`);
+  // External-content FTS5: bodies stored ONCE (docs table); fts indexes by rowid.
   conn.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
-    path, title, body)`);
+    title, body, content='docs', content_rowid='rowid')`);
+  conn.exec(`CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+    INSERT INTO docs_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body); END`);
+  conn.exec(`CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+    INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES ('delete', old.rowid, old.title, old.body); END`);
+  conn.exec(`CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+    INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES ('delete', old.rowid, old.title, old.body);
+    INSERT INTO docs_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body); END`);
   return conn;
 }
 
@@ -60,23 +70,23 @@ function refresh(force = false): Record<string, unknown> {
     `INSERT INTO docs(path, mtime, size, title, body) VALUES(?,?,?,?,?)
      ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size,
      title=excluded.title, body=excluded.body`);
-  const fts = conn.prepare(`INSERT INTO docs_fts(path, title, body) VALUES(?,?,?)`);
   const get = conn.prepare(`SELECT mtime, size FROM docs WHERE path=?`);
-  const delFts = conn.prepare(`DELETE FROM docs_fts WHERE path=?`);
-  conn.exec("BEGIN");
+  const upsert = conn.transaction((items: Array<[string, number, number, string, string]>) => {
+    for (const row of items) insert.run(...row);
+  });
+  let batch: Array<[string, number, number, string, string]> = [];
   for (const path of discover()) {
     let st; try { st = statSync(path); } catch { continue; }
     bytes += st.size;
     const row = get.get(path) as { mtime: number; size: number } | null;
-    if (row && !force && Math.abs(row.mtime - st.mtime) < 1 && row.size === st.size) continue;
+    if (row && !force && Math.abs(row.mtime - st.mtimeMs) < 1 && row.size === st.size) continue;
     let text = ""; try { text = readFileSync(path, "utf8"); } catch { continue; }
     const title = text.split("\n").find(l => l.trim())?.replace(/^#+\s*/, "").slice(0, 160) ?? "";
-    insert.run(path, st.mtime, st.size, title, text);
-    delFts.run(path);
-    fts.run(path, title, text);
+    batch.push([path, st.mtimeMs, st.size, title, text.slice(0, BODY_CAP)]);
     rescanned++;
+    if (batch.length >= 500) { upsert(batch); batch = []; }
   }
-  conn.exec("COMMIT");
+  if (batch.length) upsert(batch);
   state.indexed = (conn.query(`SELECT count(*) n FROM docs`).get() as { n: number }).n;
   state.bytes = bytes;
   state.lastRefresh = Date.now() / 1000;
@@ -91,7 +101,9 @@ function search(query: string, scope?: string, limit = 10): Record<string, unkno
   let rows: Array<{ path: string; title: string; rank: number }>;
   try {
     rows = conn.query(
-      `SELECT path, title, bm25(docs_fts) rank FROM docs_fts WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?`)
+      `SELECT d.path AS path, d.title AS title, bm25(docs_fts) AS rank
+       FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid
+       WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?`)
       .all(ftsQ, limit * 4) as typeof rows;
   } catch (e) { return { error: `fts: ${e}` }; }
   const hits = rows
