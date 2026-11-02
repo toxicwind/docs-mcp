@@ -194,7 +194,12 @@ function handleTool(name: string, args: Record<string, unknown>): unknown {
   return { error: `unknown tool ${name}` };
 }
 
-const send = (o: unknown) => Bun.write(Bun.stdout, JSON.stringify(o) + "\n");
+// Sync fd-1 write: the fd-0 readSync pump blocks the event loop, so the async
+// Bun.write(Bun.stdout) would never flush before stdin EOF — every response
+// was silently lost (probe: EXIT=0, stdout 0 bytes; anomaly #79 class, fixed
+// 2026-11-02). writeSync(1) bypasses the event loop entirely.
+import { writeSync } from "node:fs";
+const send = (o: unknown) => writeSync(1, JSON.stringify(o) + "\n");
 
 // Warm synchronously BEFORE the blocking fd-0 pump: the pump never yields to
 // the event loop, so a deferred warm would never run. 1.2s warm is well within
@@ -226,7 +231,7 @@ function pumpStdio(): void {
       const line = buf.slice(0, idx).trim();
       buf = buf.slice(idx + 1);
       if (!line) continue;
-      let msg: Record<string, any>;
+      let msg: { method?: unknown; id?: unknown };
       try { msg = JSON.parse(line); } catch { continue; }
       const { method, id } = msg;
       if (method === "initialize") {
