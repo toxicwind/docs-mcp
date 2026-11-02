@@ -149,51 +149,107 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} } },
   { name: "refresh_docs", description: "Re-index /home/toxic/pens/** docs (incremental). Args: {force?}",
     inputSchema: { type: "object", properties: { force: { type: "boolean" } } } },
+  { name: "compare_repo", description: "Consilience: live repo state from toolkit fabric.json + agentic-moment audit moments. Args: {repo? (exact name), pen?}",
+    inputSchema: { type: "object", properties: { repo: { type: "string" }, pen: { type: "string" } } } },
+  { name: "compare_list", description: "List the compare/agentic moments recorded in the audit engine (recent first). Args: {limit?}",
+    inputSchema: { type: "object", properties: { limit: { type: "integer" } } } },
 ];
+
+const FABRIC_JSON = "/home/toxic/pens/toolkit/fabric.json";
+const AUDIT_MOMENTS = "/home/toxic/pens/agentic-moment/products/audit/moments/index.jsonl";
+
+/** Live per-repo trace from the minted fabric.json (not web narrators — the
+ *  registry the toolkit generated from per-pen registries + on-disk git). */
+function fabricState(): Array<{ pen: string; name: string; head?: string; dirty?: number }> {
+  try {
+    const f = JSON.parse(readFileSync(FABRIC_JSON, "utf8")) as { pens: Array<{ pen: string; products: Array<{ name: string; head?: string; dirty?: number }> }> };
+    const out: Array<{ pen: string; name: string; head?: string; dirty?: number }> = [];
+    for (const p of f.pens) for (const prod of p.products) out.push({ pen: p.pen, name: prod.name, head: prod.head, dirty: prod.dirty });
+    return out;
+  } catch { return []; }
+}
+
+/** Agentic moments from the audit engine — the compare trace, most recent first. */
+function auditMoments(limit = 20): Array<{ ts: string; title: string; tags: string[] }> {
+  try {
+    const lines = readFileSync(AUDIT_MOMENTS, "utf8").split("\n").filter(Boolean);
+    return lines.slice(-limit).reverse().map(l => { try { const m = JSON.parse(l); return { ts: m.ts, title: m.title, tags: m.tags ?? [] }; } catch { return undefined; } }).filter(Boolean) as Array<{ ts: string; title: string; tags: string[] }>;
+  } catch { return []; }
+}
+
+function compareRepo(repo?: string, pen?: string): unknown {
+  const all = fabricState();
+  const matches = (repo ? all.filter(r => r.name === repo) : all).filter(r => !pen || r.pen === pen);
+  const moments = (repo || pen ? auditMoments(1000) : []).filter(m => !repo || m.title.toLowerCase().includes(repo.toLowerCase()) || m.tags.some(t => t.toLowerCase().includes(repo.toLowerCase())));
+  return { repo: repo ?? pen ?? "*", state: matches.slice(0, 25), moments: moments.slice(0, 10), count: matches.length };
+}
 
 function handleTool(name: string, args: Record<string, unknown>): unknown {
   if (name === "search_docs") return search(String(args.query ?? ""), args.scope as string | undefined, Number(args.limit ?? 10));
   if (name === "read_doc") return readDoc(String(args.path), Number(args.offset ?? 1), Number(args.limit ?? 120));
   if (name === "doc_stats") return state.indexed ? state : { note: "index cold", ...state };
   if (name === "refresh_docs") return refresh(Boolean(args.force));
+  if (name === "compare_repo") return compareRepo(args.repo ? String(args.repo) : undefined, args.pen ? String(args.pen) : undefined);
+  if (name === "compare_list") return { moments: auditMoments(Number(args.limit ?? 20)) };
   return { error: `unknown tool ${name}` };
 }
 
 const send = (o: unknown) => Bun.write(Bun.stdout, JSON.stringify(o) + "\n");
 
-// index in background (warm), serve immediately
-setTimeout(() => { const r = refresh(); console.error(`docs-mcp: warmed ${r.docs} docs in ${r.tookMs}ms`); }, 0);
+// Warm synchronously BEFORE the blocking fd-0 pump: the pump never yields to
+// the event loop, so a deferred warm would never run. 1.2s warm is well within
+// the gateway's 30s initialize deadline.
+{
+  const r = refresh();
+  console.error(`docs-mcp: warmed ${r.docs} docs in ${r.tookMs}ms`);
+}
 
-// zero-copy stdio JSON-RPC
-let buf = "";
-for await (const chunk of Bun.stdin.stream()) {
-  buf += chunk;
-  let idx;
-  while ((idx = buf.indexOf("\n")) >= 0) {
-    const line = buf.slice(0, idx).trim();
-    buf = buf.slice(idx + 1);
-    if (!line) continue;
-    let msg: Record<string, any>;
-    try { msg = JSON.parse(line); } catch { continue; }
-    const { method, id } = msg;
-    if (method === "initialize") {
-      await send({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05",
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "docs-mcp", version: "1.1.0-bun" } } });
-    } else if (method === "tools/list") {
-      await send({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
-    } else if (method === "tools/call") {
-      const p = msg.params ?? {};
-      try {
-        const result = handleTool(p.name, p.arguments ?? {});
-        await send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] } });
-      } catch (e) {
-        await send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `error: ${e}` }] } });
+// stdio JSON-RPC via synchronous fd-0 pump.
+// Bun 1.4.4 regression: Bun.stdin / Bun.stdin.stream() async iteration never
+// yields piped stdin (verified: node sees bytes, both bun installs see none,
+// raw fs.readSync(0) works). kappa anomaly #79 hit the same class of bug.
+// Deterministic blocking read pump — reads fd 0 until EOF, dispatches lines.
+import { readSync } from "node:fs";
+
+const FD0 = 0;
+const CHUNK = Buffer.alloc(65_536);
+
+function pumpStdio(): void {
+  let buf = "";
+  while (true) {
+    let n: number;
+    try { n = readSync(FD0, CHUNK, 0, CHUNK.length, null); } catch { break; }
+    if (n <= 0) break; // EOF or EAGAIN-ish → done
+    buf += CHUNK.toString("utf8", 0, n);
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      let msg: Record<string, any>;
+      try { msg = JSON.parse(line); } catch { continue; }
+      const { method, id } = msg;
+      if (method === "initialize") {
+        send({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05",
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: "docs-mcp", version: "1.2.0-bun" } } });
+      } else if (method === "tools/list") {
+        send({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+      } else if (method === "tools/call") {
+        const p = msg.params ?? {};
+        try {
+          const result = handleTool(p.name, p.arguments ?? {});
+          send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] } });
+        } catch (e) {
+          send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `error: ${e}` }] } });
+        }
+      } else if (method === "ping") {
+        send({ jsonrpc: "2.0", id, result: {} });
+      } else if (id !== undefined && method !== "notifications/initialized") {
+        send({ jsonrpc: "2.0", id, error: { code: -32601, message: `method ${method} not supported` } });
       }
-    } else if (method === "ping") {
-      await send({ jsonrpc: "2.0", id, result: {} });
-    } else if (id !== undefined && method !== "notifications/initialized") {
-      await send({ jsonrpc: "2.0", id, error: { code: -32601, message: `method ${method} not supported` } });
     }
   }
 }
+
+pumpStdio();
