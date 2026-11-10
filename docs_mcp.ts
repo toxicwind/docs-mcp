@@ -94,6 +94,56 @@ function refresh(force = false): Record<string, unknown> {
   return { docs: state.indexed, rescanned, bytes, tookMs: Math.round(performance.now() - t0) };
 }
 
+const ARGOS_URL = process.env.ARGOS_URL ?? "http://127.0.0.1:25251";
+
+/** Argos (xerj) lane: full-tree semantic/BM25 search over the pens index.
+ *  Code-raced 2026-11-04: for COMPLEX queries the winner is bool_semantic_boost —
+ *  a bool with `should` = cross_fields multi_match (semantic) + match_phrase
+ *  (precision), minimum_should_match:1 (recall). Strict AND forms (bool_compound,
+ *  multi_match operator:and) return 0 hits on multi-term queries. */
+async function argosSearch(query: string, scope?: string, limit = 10): Promise<Record<string, unknown> | null> {
+  const body = {
+    query: {
+      bool: {
+        should: [
+          { multi_match: { query, fields: ["title^5", "text"], type: "cross_fields" } },
+          { match_phrase: { text: query } },
+        ],
+        minimum_should_match: 1,
+      },
+    },
+    size: limit * 4,
+    _source: ["ax_path", "title", "text"],
+  };
+  try {
+    const res = await fetch(`${ARGOS_URL}/_search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const hits = (data?.hits?.hits ?? [])
+      .map((h: any) => {
+        const src = h?._source ?? {};
+        const path = String(src.ax_path ?? "").replace(/^kind:[^/]+\//, "");
+        return {
+          path,
+          title: src.title ?? path,
+          score: Math.round((h._score ?? 0) * 1000) / 1000,
+          snippet: String(src.text ?? "").slice(0, 320).replace(/\n/g, " "),
+        };
+      })
+      .filter((r: any) => !scope || r.path.includes(scope))
+      .slice(0, limit);
+    if (hits.length) return { query, backend: "argos", hits, count: hits.length };
+  } catch {
+    /* fall through to FTS */
+  }
+  return null;
+}
+
 function search(query: string, scope?: string, limit = 10): Record<string, unknown> {
   if (state.scanning || !state.indexed)
     return { query, indexing: true, note: "index warming; live lane below", live: liveGrep(query, scope, limit) };
@@ -184,8 +234,15 @@ function compareRepo(repo?: string, pen?: string): unknown {
   return { repo: repo ?? pen ?? "*", state: matches.slice(0, 25), moments: moments.slice(0, 10), count: matches.length };
 }
 
-function handleTool(name: string, args: Record<string, unknown>): unknown {
-  if (name === "search_docs") return search(String(args.query ?? ""), args.scope as string | undefined, Number(args.limit ?? 10));
+async function handleTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  if (name === "search_docs") {
+    const q = String(args.query ?? "");
+    const scope = args.scope ? String(args.scope) : undefined;
+    const limit = Number(args.limit ?? 10);
+    const argos = await argosSearch(q, scope, limit);
+    if (argos) return argos;
+    return search(q, scope, limit);
+  }
   if (name === "read_doc") return readDoc(String(args.path), Number(args.offset ?? 1), Number(args.limit ?? 120));
   if (name === "doc_stats") return state.indexed ? state : { note: "index cold", ...state };
   if (name === "refresh_docs") return refresh(Boolean(args.force));
@@ -219,12 +276,22 @@ import { readSync } from "node:fs";
 const FD0 = 0;
 const CHUNK = Buffer.alloc(65_536);
 
+async function handleToolCall(msg: any, id: unknown): Promise<void> {
+  try {
+    const params = msg.params ?? {};
+    const result = await handleTool(params.name, params.arguments ?? {});
+    send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] } });
+  } catch (e) {
+    send({ jsonrpc: "2.0", id, error: { code: -32603, message: `error: ${e}` } });
+  }
+}
+
 function pumpStdio(): void {
   let buf = "";
   while (true) {
     let n: number;
     try { n = readSync(FD0, CHUNK, 0, CHUNK.length, null); } catch { break; }
-    if (n <= 0) break; // EOF or EAGAIN-ish → done
+    if (n <= 0) break;
     buf += CHUNK.toString("utf8", 0, n);
     let idx;
     while ((idx = buf.indexOf("\n")) >= 0) {
@@ -241,13 +308,10 @@ function pumpStdio(): void {
       } else if (method === "tools/list") {
         send({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
       } else if (method === "tools/call") {
-        const p = msg.params ?? {};
-        try {
-          const result = handleTool(p.name, p.arguments ?? {});
-          send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] } });
-        } catch (e) {
-          send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `error: ${e}` }] } });
-        }
+        // Fire-and-forget async: the stdio pump is synchronous, so dispatch the
+        // async handler and send the response when it resolves. Keeps the pump
+        // non-blocking for the argos lane (which is async fetch).
+        void handleToolCall(msg, id);
       } else if (method === "ping") {
         send({ jsonrpc: "2.0", id, result: {} });
       } else if (id !== undefined && method !== "notifications/initialized") {
